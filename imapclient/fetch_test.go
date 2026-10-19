@@ -2,6 +2,7 @@ package imapclient_test
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"reflect"
@@ -127,6 +128,62 @@ func TestFetch_gmailIDs(t *testing.T) {
 	}
 	if got := messages[0].GmailThreadID; got != 18446744073709551615 {
 		t.Errorf("GmailThreadID = %v, want 18446744073709551615", got)
+	}
+}
+
+// errAfterConn fails reads with err once the server's side has been read.
+type errAfterConn struct {
+	net.Conn
+	err error
+}
+
+func (c errAfterConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if err == io.EOF {
+		err = c.err
+	}
+	return n, err
+}
+
+// A stream that fails inside a literal with something other than io.EOF, as a
+// decompressor or a reset connection does, must report that error rather than
+// "a literal is open".
+func TestFetch_literalReadError(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	errBroken := errors.New("stream broken")
+
+	go func() {
+		io.WriteString(serverConn, "* OK [CAPABILITY IMAP4rev1] ready\r\n")
+		br := bufio.NewReader(serverConn)
+		if _, err := br.ReadString('\n'); err != nil {
+			return
+		}
+		io.WriteString(serverConn, "* 1 FETCH (UID 1 BODY[] {100}\r\n0123456789")
+		serverConn.Close()
+	}()
+
+	client := imapclient.New(errAfterConn{clientConn, errBroken}, nil)
+	defer client.Close()
+	if err := client.WaitGreeting(); err != nil {
+		t.Fatalf("WaitGreeting() = %v", err)
+	}
+
+	cmd := client.Fetch(imap.UIDSetNum(1), &imap.FetchOptions{
+		BodySection: []*imap.FetchItemBodySection{{}},
+	})
+	msg := cmd.Next()
+	if msg == nil {
+		t.Fatalf("Next() = nil, want a message")
+	}
+	for item := msg.Next(); item != nil; item = msg.Next() {
+		if body, ok := item.(imapclient.FetchItemDataBodySection); ok {
+			if _, err := io.ReadAll(body.Literal); !errors.Is(err, errBroken) {
+				t.Errorf("reading the literal = %v, want %v", err, errBroken)
+			}
+		}
+	}
+	if err := cmd.Close(); err == nil || !strings.Contains(err.Error(), errBroken.Error()) {
+		t.Errorf("Close() = %v, want the stream's error", err)
 	}
 }
 

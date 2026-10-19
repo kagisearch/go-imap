@@ -644,7 +644,13 @@ func (lit *LiteralReader) Size() int64 {
 
 func (lit *LiteralReader) Read(b []byte) (int, error) {
 	n, err := lit.r.Read(b)
-	if err == io.EOF {
+	if err != nil && err != io.EOF && lit.dec != nil {
+		// The stream broke inside the literal. Keep its error as the
+		// decoder's, rather than failing the next read with "a literal is
+		// open".
+		lit.dec.returnErr(err)
+	}
+	if err != nil {
 		lit.cancel()
 	}
 	return n, err
