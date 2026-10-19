@@ -1,10 +1,15 @@
 package imapclient_test
 
 import (
+	"bufio"
+	"io"
+	"net"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 )
 
 func TestFetch(t *testing.T) {
@@ -35,5 +40,92 @@ func TestFetch(t *testing.T) {
 	body := strings.ReplaceAll(string(b), "\r\n", "\n")
 	if body != simpleRawMessage {
 		t.Errorf("body mismatch: got \n%v\n but want \n%v", body, simpleRawMessage)
+	}
+}
+
+func TestFetch_gmailLabels(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	go func() {
+		io.WriteString(serverConn, "* OK [CAPABILITY IMAP4rev1 X-GM-EXT-1] ready\r\n")
+		br := bufio.NewReader(serverConn)
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return
+		}
+		tag, _, _ := strings.Cut(line, " ")
+		// System labels come as atoms or quoted, other labels as astrings
+		// encoded like mailbox names.
+		io.WriteString(serverConn, `* 1 FETCH (UID 7 X-GM-LABELS (\Inbox "\\Important" Work "Muy Importante" "Caf&AOk-"))`+"\r\n")
+		io.WriteString(serverConn, "* 2 FETCH (UID 8 X-GM-LABELS ())\r\n")
+		io.WriteString(serverConn, `* 3 FETCH (UID 9 X-GM-LABELS ( \Sent))`+"\r\n")
+		io.WriteString(serverConn, tag+" OK done\r\n")
+	}()
+
+	client := imapclient.New(clientConn, nil)
+	defer client.Close()
+	if err := client.WaitGreeting(); err != nil {
+		t.Fatalf("WaitGreeting() = %v", err)
+	}
+
+	messages, err := client.Fetch(imap.UIDSetNum(7, 8, 9), &imap.FetchOptions{GmailLabels: true}).Collect()
+	if err != nil {
+		t.Fatalf("Fetch() = %v", err)
+	}
+	if len(messages) != 3 {
+		t.Fatalf("len(messages) = %v, want 3", len(messages))
+	}
+	want := []string{`\Inbox`, `\Important`, "Work", "Muy Importante", "Café"}
+	if got := messages[0].GmailLabels; !reflect.DeepEqual(got, want) {
+		t.Errorf("GmailLabels = %q, want %q", got, want)
+	}
+	if got := messages[1].GmailLabels; len(got) != 0 {
+		t.Errorf("GmailLabels = %q, want none", got)
+	}
+	if got := messages[2].GmailLabels; !reflect.DeepEqual(got, []string{`\Sent`}) {
+		t.Errorf("GmailLabels = %q, want [\\Sent]", got)
+	}
+}
+
+// A literal the stream breaks inside of ends early. Reading it again, as
+// discarding the rest of the message does, must not touch the connection the
+// client has moved on with.
+func TestFetch_literalCutShort(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+
+	go func() {
+		io.WriteString(serverConn, "* OK [CAPABILITY IMAP4rev1] ready\r\n")
+		br := bufio.NewReader(serverConn)
+		if _, err := br.ReadString('\n'); err != nil {
+			return
+		}
+		io.WriteString(serverConn, "* 1 FETCH (UID 1 BODY[] {100}\r\n0123456789")
+		serverConn.Close()
+	}()
+
+	client := imapclient.New(clientConn, nil)
+	defer client.Close()
+	if err := client.WaitGreeting(); err != nil {
+		t.Fatalf("WaitGreeting() = %v", err)
+	}
+
+	cmd := client.Fetch(imap.UIDSetNum(1), &imap.FetchOptions{
+		BodySection: []*imap.FetchItemBodySection{{}},
+	})
+	msg := cmd.Next()
+	if msg == nil {
+		t.Fatalf("Next() = nil, want a message")
+	}
+	for item := msg.Next(); item != nil; item = msg.Next() {
+		if body, ok := item.(imapclient.FetchItemDataBodySection); ok {
+			b, _ := io.ReadAll(body.Literal)
+			if len(b) >= 100 {
+				t.Errorf("read %d bytes of a literal cut at 10", len(b))
+			}
+		}
+	}
+	if err := cmd.Close(); err == nil {
+		t.Errorf("Close() = nil, want the broken stream's error")
 	}
 }

@@ -57,6 +57,7 @@ func writeFetchItems(enc *imapwire.Encoder, numKind imapwire.NumKind, options *i
 		"INTERNALDATE":  options.InternalDate,
 		"RFC822.SIZE":   options.RFC822Size,
 		"MODSEQ":        options.ModSeq,
+		"X-GM-LABELS":   options.GmailLabels,
 	}
 	for k, req := range m {
 		if req {
@@ -479,6 +480,19 @@ type FetchItemDataModSeq struct {
 
 func (FetchItemDataModSeq) fetchItemData() {}
 
+// FetchItemDataGmailLabels holds data returned by FETCH X-GM-LABELS.
+//
+// Labels starting with a backslash are Gmail's system labels (\Inbox, \Sent,
+// \Important, \Starred, \Draft). Other labels are decoded the way mailbox
+// names are, so they match the names returned by LIST.
+//
+// This requires the X-GM-EXT-1 extension.
+type FetchItemDataGmailLabels struct {
+	Labels []string
+}
+
+func (FetchItemDataGmailLabels) fetchItemData() {}
+
 // FetchBodySectionBuffer is a buffer for the data returned by
 // FetchItemBodySection.
 type FetchBodySectionBuffer struct {
@@ -507,7 +521,8 @@ type FetchMessageBuffer struct {
 	BodySection       []FetchBodySectionBuffer
 	BinarySection     []FetchBinarySectionBuffer
 	BinarySectionSize []FetchItemDataBinarySectionSize
-	ModSeq            uint64 // requires CONDSTORE
+	ModSeq            uint64   // requires CONDSTORE
+	GmailLabels       []string // requires X-GM-EXT-1
 }
 
 func (buf *FetchMessageBuffer) populateItemData(item FetchItemData) error {
@@ -554,6 +569,8 @@ func (buf *FetchMessageBuffer) populateItemData(item FetchItemData) error {
 		buf.BinarySectionSize = append(buf.BinarySectionSize, item)
 	case FetchItemDataModSeq:
 		buf.ModSeq = item.ModSeq
+	case FetchItemDataGmailLabels:
+		buf.GmailLabels = item.Labels
 	default:
 		panic(fmt.Errorf("unsupported fetch item data %T", item))
 	}
@@ -801,6 +818,15 @@ func (c *Client) handleFetch(seqNum uint32) error {
 				return dec.Err()
 			}
 			item = FetchItemDataModSeq{ModSeq: modSeq}
+		case "X-GM-LABELS":
+			if !dec.ExpectSP() {
+				return dec.Err()
+			}
+			labels, err := readGmailLabels(dec)
+			if err != nil {
+				return fmt.Errorf("in X-GM-LABELS: %w", err)
+			}
+			item = FetchItemDataGmailLabels{Labels: labels}
 		default:
 			return fmt.Errorf("unsupported msg-att name: %q", attName)
 		}
@@ -822,6 +848,30 @@ func (c *Client) handleFetch(seqNum uint32) error {
 		}
 		return nil
 	})
+}
+
+// readGmailLabels reads the parenthesized list of an X-GM-LABELS item. System
+// labels are sent as atoms starting with a backslash, other labels as astrings
+// encoded like mailbox names.
+func readGmailLabels(dec *imapwire.Decoder) ([]string, error) {
+	labels := []string{}
+	err := dec.ExpectList(func() error {
+		// Some servers start the list with a space, as with flag lists.
+		dec.SP()
+
+		var label string
+		if dec.Special('\\') {
+			if !dec.ExpectAtom(&label) {
+				return dec.Err()
+			}
+			label = "\\" + label
+		} else if !dec.ExpectMailbox(&label) {
+			return dec.Err()
+		}
+		labels = append(labels, label)
+		return nil
+	})
+	return labels, err
 }
 
 func isMsgAttNameChar(ch byte) bool {
@@ -1313,14 +1363,24 @@ func readSectionPart(dec *imapwire.Decoder) (part []int, dot bool) {
 
 type fetchLiteralReader struct {
 	*imapwire.LiteralReader
-	ch chan<- struct{}
+	ch  chan<- struct{}
+	err error
 }
 
 func (lit *fetchLiteralReader) Read(b []byte) (int, error) {
+	// Once the literal has returned an error, the reader goroutine has moved
+	// on with the connection. Reading the literal again, as discarding the
+	// message does after a stream broke inside it, must not touch it.
+	if lit.err != nil {
+		return 0, lit.err
+	}
 	n, err := lit.LiteralReader.Read(b)
-	if err != nil && lit.ch != nil {
-		close(lit.ch)
-		lit.ch = nil
+	if err != nil {
+		lit.err = err
+		if lit.ch != nil {
+			close(lit.ch)
+			lit.ch = nil
+		}
 	}
 	return n, err
 }
