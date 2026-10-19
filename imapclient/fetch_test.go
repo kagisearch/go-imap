@@ -88,6 +88,48 @@ func TestFetch_gmailLabels(t *testing.T) {
 	}
 }
 
+func TestFetch_gmailIDs(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+
+	cmdCh := make(chan string, 1)
+	go func() {
+		io.WriteString(serverConn, "* OK [CAPABILITY IMAP4rev1 X-GM-EXT-1] ready\r\n")
+		br := bufio.NewReader(serverConn)
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return
+		}
+		cmdCh <- line
+		tag, _, _ := strings.Cut(line, " ")
+		io.WriteString(serverConn, "* 1 FETCH (UID 7 X-GM-MSGID 1278455344230334865 X-GM-THRID 18446744073709551615)\r\n")
+		io.WriteString(serverConn, tag+" OK done\r\n")
+	}()
+
+	client := imapclient.New(clientConn, nil)
+	defer client.Close()
+	if err := client.WaitGreeting(); err != nil {
+		t.Fatalf("WaitGreeting() = %v", err)
+	}
+
+	messages, err := client.Fetch(imap.UIDSetNum(7), &imap.FetchOptions{GmailMsgID: true, GmailThreadID: true}).Collect()
+	if err != nil {
+		t.Fatalf("Fetch() = %v", err)
+	}
+	if cmd := <-cmdCh; !strings.Contains(cmd, "X-GM-MSGID") || !strings.Contains(cmd, "X-GM-THRID") {
+		t.Errorf("command %q does not request X-GM-MSGID and X-GM-THRID", cmd)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("len(messages) = %v, want 1", len(messages))
+	}
+	if got := messages[0].GmailMsgID; got != 1278455344230334865 {
+		t.Errorf("GmailMsgID = %v, want 1278455344230334865", got)
+	}
+	if got := messages[0].GmailThreadID; got != 18446744073709551615 {
+		t.Errorf("GmailThreadID = %v, want 18446744073709551615", got)
+	}
+}
+
 // A literal the stream breaks inside of ends early. Reading it again, as
 // discarding the rest of the message does, must not touch the connection the
 // client has moved on with.

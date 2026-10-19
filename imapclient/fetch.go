@@ -58,6 +58,8 @@ func writeFetchItems(enc *imapwire.Encoder, numKind imapwire.NumKind, options *i
 		"RFC822.SIZE":   options.RFC822Size,
 		"MODSEQ":        options.ModSeq,
 		"X-GM-LABELS":   options.GmailLabels,
+		"X-GM-MSGID":    options.GmailMsgID,
+		"X-GM-THRID":    options.GmailThreadID,
 	}
 	for k, req := range m {
 		if req {
@@ -493,6 +495,26 @@ type FetchItemDataGmailLabels struct {
 
 func (FetchItemDataGmailLabels) fetchItemData() {}
 
+// FetchItemDataGmailMsgID holds data returned by FETCH X-GM-MSGID: Gmail's
+// ID for the message, the same in every mailbox it appears in.
+//
+// This requires the X-GM-EXT-1 extension.
+type FetchItemDataGmailMsgID struct {
+	MsgID uint64
+}
+
+func (FetchItemDataGmailMsgID) fetchItemData() {}
+
+// FetchItemDataGmailThreadID holds data returned by FETCH X-GM-THRID: Gmail's
+// ID for the thread the message belongs to.
+//
+// This requires the X-GM-EXT-1 extension.
+type FetchItemDataGmailThreadID struct {
+	ThreadID uint64
+}
+
+func (FetchItemDataGmailThreadID) fetchItemData() {}
+
 // FetchBodySectionBuffer is a buffer for the data returned by
 // FetchItemBodySection.
 type FetchBodySectionBuffer struct {
@@ -523,6 +545,8 @@ type FetchMessageBuffer struct {
 	BinarySectionSize []FetchItemDataBinarySectionSize
 	ModSeq            uint64   // requires CONDSTORE
 	GmailLabels       []string // requires X-GM-EXT-1
+	GmailMsgID        uint64   // requires X-GM-EXT-1
+	GmailThreadID     uint64   // requires X-GM-EXT-1
 }
 
 func (buf *FetchMessageBuffer) populateItemData(item FetchItemData) error {
@@ -571,6 +595,10 @@ func (buf *FetchMessageBuffer) populateItemData(item FetchItemData) error {
 		buf.ModSeq = item.ModSeq
 	case FetchItemDataGmailLabels:
 		buf.GmailLabels = item.Labels
+	case FetchItemDataGmailMsgID:
+		buf.GmailMsgID = item.MsgID
+	case FetchItemDataGmailThreadID:
+		buf.GmailThreadID = item.ThreadID
 	default:
 		panic(fmt.Errorf("unsupported fetch item data %T", item))
 	}
@@ -827,6 +855,17 @@ func (c *Client) handleFetch(seqNum uint32) error {
 				return fmt.Errorf("in X-GM-LABELS: %w", err)
 			}
 			item = FetchItemDataGmailLabels{Labels: labels}
+		case "X-GM-MSGID", "X-GM-THRID":
+			// Both are unsigned 64-bit numbers, parsed like a mod-sequence
+			var id uint64
+			if !dec.ExpectSP() || !dec.Expect(dec.ModSeq(&id), "64-bit number") {
+				return dec.Err()
+			}
+			if attName == "X-GM-MSGID" {
+				item = FetchItemDataGmailMsgID{MsgID: id}
+			} else {
+				item = FetchItemDataGmailThreadID{ThreadID: id}
+			}
 		default:
 			return fmt.Errorf("unsupported msg-att name: %q", attName)
 		}
