@@ -142,6 +142,7 @@ func (options *Options) dialer() *net.Dialer {
 type Client struct {
 	conn     net.Conn
 	options  Options
+	stream   io.ReadWriter // conn, or the TLS stream over it after STARTTLS
 	br       *bufio.Reader
 	bw       *bufio.Writer
 	dec      *imapwire.Decoder
@@ -183,6 +184,7 @@ func New(conn net.Conn, options *Options) *Client {
 	client := &Client{
 		conn:       conn,
 		options:    *options,
+		stream:     conn,
 		br:         br,
 		bw:         bw,
 		dec:        imapwire.NewDecoder(br, imapwire.ConnSideClient),
@@ -651,13 +653,13 @@ func (c *Client) readResponse() error {
 	typ = strings.ToUpper(typ)
 
 	var (
-		token    string
-		err      error
-		startTLS *startTLSCommand
+		token   string
+		err     error
+		upgrade command
 	)
 	if tag != "" {
 		token = "response-tagged"
-		startTLS, err = c.readResponseTagged(tag, typ)
+		upgrade, err = c.readResponseTagged(tag, typ)
 	} else {
 		token = "response-data"
 		err = c.readResponseData(typ)
@@ -670,8 +672,11 @@ func (c *Client) readResponse() error {
 		return fmt.Errorf("in response: %w", c.dec.Err())
 	}
 
-	if startTLS != nil {
-		c.upgradeStartTLS(startTLS)
+	switch cmd := upgrade.(type) {
+	case *startTLSCommand:
+		c.upgradeStartTLS(cmd)
+	case *compressCommand:
+		c.upgradeCompress(cmd)
 	}
 
 	return nil
@@ -702,7 +707,10 @@ func (c *Client) readContinueReq() error {
 	return nil
 }
 
-func (c *Client) readResponseTagged(tag, typ string) (startTLS *startTLSCommand, err error) {
+// readResponseTagged reads a tagged response. If it completes a command that
+// changes the connection's stream, that command is returned so the caller can
+// switch streams once the whole response has been read.
+func (c *Client) readResponseTagged(tag, typ string) (upgrade command, err error) {
 	cmd := c.deletePendingCmdByTag(tag)
 	if cmd == nil {
 		return nil, fmt.Errorf("received tagged response with unknown tag %q", tag)
@@ -796,8 +804,11 @@ func (c *Client) readResponseTagged(tag, typ string) (startTLS *startTLSCommand,
 
 	c.completeCommand(cmd, cmdErr)
 
-	if cmd, ok := cmd.(*startTLSCommand); ok && cmdErr == nil {
-		startTLS = cmd
+	if cmdErr == nil {
+		switch cmd.(type) {
+		case *startTLSCommand, *compressCommand:
+			upgrade = cmd
+		}
 	}
 
 	if cmdErr == nil && code != "CAPABILITY" {
@@ -808,7 +819,7 @@ func (c *Client) readResponseTagged(tag, typ string) (startTLS *startTLSCommand,
 		}
 	}
 
-	return startTLS, nil
+	return upgrade, nil
 }
 
 func (c *Client) readResponseData(typ string) error {
