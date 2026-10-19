@@ -1363,14 +1363,24 @@ func readSectionPart(dec *imapwire.Decoder) (part []int, dot bool) {
 
 type fetchLiteralReader struct {
 	*imapwire.LiteralReader
-	ch chan<- struct{}
+	ch  chan<- struct{}
+	err error
 }
 
 func (lit *fetchLiteralReader) Read(b []byte) (int, error) {
+	// Once the literal has returned an error, the reader goroutine has moved
+	// on with the connection. Reading the literal again, as discarding the
+	// message does after a stream broke inside it, must not touch it.
+	if lit.err != nil {
+		return 0, lit.err
+	}
 	n, err := lit.LiteralReader.Read(b)
-	if err != nil && lit.ch != nil {
-		close(lit.ch)
-		lit.ch = nil
+	if err != nil {
+		lit.err = err
+		if lit.ch != nil {
+			close(lit.ch)
+			lit.ch = nil
+		}
 	}
 	return n, err
 }
