@@ -856,6 +856,9 @@ func (c *Client) handleFetch(seqNum uint32) error {
 func readGmailLabels(dec *imapwire.Decoder) ([]string, error) {
 	labels := []string{}
 	err := dec.ExpectList(func() error {
+		// Some servers start the list with a space, as with flag lists.
+		dec.SP()
+
 		var label string
 		if dec.Special('\\') {
 			if !dec.ExpectAtom(&label) {

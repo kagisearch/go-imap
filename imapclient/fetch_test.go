@@ -59,6 +59,7 @@ func TestFetch_gmailLabels(t *testing.T) {
 		// encoded like mailbox names.
 		io.WriteString(serverConn, `* 1 FETCH (UID 7 X-GM-LABELS (\Inbox "\\Important" Work "Muy Importante" "Caf&AOk-"))`+"\r\n")
 		io.WriteString(serverConn, "* 2 FETCH (UID 8 X-GM-LABELS ())\r\n")
+		io.WriteString(serverConn, `* 3 FETCH (UID 9 X-GM-LABELS ( \Sent))`+"\r\n")
 		io.WriteString(serverConn, tag+" OK done\r\n")
 	}()
 
@@ -68,12 +69,12 @@ func TestFetch_gmailLabels(t *testing.T) {
 		t.Fatalf("WaitGreeting() = %v", err)
 	}
 
-	messages, err := client.Fetch(imap.UIDSetNum(7, 8), &imap.FetchOptions{GmailLabels: true}).Collect()
+	messages, err := client.Fetch(imap.UIDSetNum(7, 8, 9), &imap.FetchOptions{GmailLabels: true}).Collect()
 	if err != nil {
 		t.Fatalf("Fetch() = %v", err)
 	}
-	if len(messages) != 2 {
-		t.Fatalf("len(messages) = %v, want 2", len(messages))
+	if len(messages) != 3 {
+		t.Fatalf("len(messages) = %v, want 3", len(messages))
 	}
 	want := []string{`\Inbox`, `\Important`, "Work", "Muy Importante", "Café"}
 	if got := messages[0].GmailLabels; !reflect.DeepEqual(got, want) {
@@ -81,5 +82,8 @@ func TestFetch_gmailLabels(t *testing.T) {
 	}
 	if got := messages[1].GmailLabels; len(got) != 0 {
 		t.Errorf("GmailLabels = %q, want none", got)
+	}
+	if got := messages[2].GmailLabels; !reflect.DeepEqual(got, []string{`\Sent`}) {
+		t.Errorf("GmailLabels = %q, want [\\Sent]", got)
 	}
 }
