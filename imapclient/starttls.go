@@ -55,6 +55,7 @@ func (c *Client) upgradeStartTLS(startTLS *startTLSCommand) {
 	}
 
 	tlsConn := tls.Client(cleartextConn, startTLS.tlsConfig)
+	c.stream = tlsConn
 	rw := c.options.wrapReadWriter(tlsConn)
 
 	c.br.Reset(rw)
